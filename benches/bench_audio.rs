@@ -57,21 +57,21 @@ fn make_adx(groups: usize) -> Vec<u8> {
 
 fn make_hca(frames: u32) -> Vec<u8> {
     let comp = HcaComp {
-        min_resolution: 0,
+        min_resolution: 1,
         max_resolution: 15,
         track_count: 1,
         channel_config: 0,
-        total_bands: 8,
-        base_bands: 8,
+        total_bands: 16,
+        base_bands: 16,
         stereo_bands: 0,
         bands_per_hfr_group: 0,
     };
     let mut bytes =
-        build_hca_header(0x0200, 2, 44100, frames, 512, comp, Some(1), None, 0, None).unwrap();
-    let enc = HcaEncoder::new(2, 8, 0, 512, HcaCipher::none()).unwrap();
+        build_hca_header(0x0200, 2, 44100, frames, 512, comp, Some(0), None, 0, None).unwrap();
+    let enc = HcaEncoder::new(2, 16, 0, 512, HcaCipher::none()).unwrap();
     let mut spectrum = [0.0f32; 128];
-    for (i, v) in spectrum.iter_mut().enumerate() {
-        *v = ((i * 37 % 13) as f32 - 6.0) * 20.0;
+    for (i, v) in spectrum.iter_mut().enumerate().take(16) {
+        *v = ((i * 37 % 13) as f32 - 6.0) * 0.5;
     }
     for _ in 0..frames {
         let mut frame = [0u8; 512];
@@ -107,8 +107,8 @@ fn main() {
         adx_samples
     );
 
-    // HCA: frames covering ~10 seconds (128 samples/frame/channel)
-    let frames = 44100 * 10 / 128;
+    // HCA: frames covering ~10 seconds (1024 samples/frame/channel)
+    let frames = 44100 * 10 / 1024;
     let hca_bytes = make_hca(frames);
     let mut hdec = HcaDecoder::new(&hca_bytes).unwrap();
     let mut hbuf = [0i16; 1024 * 2];

@@ -275,6 +275,7 @@ impl AdxHeader {
         let marker_at = header_size - 6;
         let remaining = marker_at.saturating_sub(history_end);
         let loop_points = match remaining {
+            0 => None,
             2 => {
                 if be_u16(header, history_end)? != 0 {
                     return Err(Error::InvalidField {
@@ -284,8 +285,10 @@ impl AdxHeader {
                 }
                 None
             }
-            28 => {
-                // 26-byte extension + 2-byte zero terminator at its end.
+            26 | 28 => {
+                // Real CRI v4 loop extension is 26 bytes (0x1a):
+                // padding(u16) + alignment(u16) + enabled(u32) + start_sample(u32)
+                // + start_byte(u32) + end_sample(u32) + end_byte(u32) + zero(u16).
                 let at = history_end;
                 let _padding = be_u16(header, at)?;
                 let _alignment = be_u16(header, at + 2)?;
@@ -315,15 +318,10 @@ impl AdxHeader {
                 }
             }
             _ => {
-                // Tolerate v3 headers with no extension at all.
-                if remaining == 0 {
-                    None
-                } else {
-                    return Err(Error::InvalidField {
-                        what: "header extension",
-                        value: remaining as u64,
-                    });
-                }
+                return Err(Error::InvalidField {
+                    what: "header extension",
+                    value: remaining as u64,
+                });
             }
         };
         let (coeff1, coeff2) = match encoding {
@@ -406,26 +404,51 @@ impl<'a> AdxView<'a> {
     }
 }
 
-/// LCG key stream for ADX encryption types 8 and 9.
+/// 15-bit LCG key stream for CRI ADX encryption types 8 and 9.
+///
+/// CRI ADX type 8 and type 9 encrypt each frame's 13-bit scale header
+/// (`bytes[0..2] & 0x1FFF`) with `xor & 0x1FFF`, stepping
+/// `xor = (xor * mult + inc) & 0x7FFF` once per channel frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LcgKeyStream {
-    state: u32,
+    state: u16,
+    initial: u16,
+    mult: u16,
+    inc: u16,
     kind: EncryptionType,
-    initial: u32,
 }
 
 impl LcgKeyStream {
-    /// Create a key stream for `kind` from a 64-bit key.
-    pub fn new(kind: EncryptionType, key: u64) -> Self {
-        let mut s = (key as u32) ^ ((key >> 32) as u32);
-        if s == 0 {
-            s = 0x1357_9BDF;
-        }
+    /// Create a key stream from explicit CRI LCG parameters `(start, mult, inc)`.
+    pub fn from_params(kind: EncryptionType, start: u16, mult: u16, inc: u16) -> Self {
+        let s = start & 0x7FFF;
         Self {
             state: s,
-            kind,
             initial: s,
+            mult: mult & 0x7FFF,
+            inc: inc & 0x7FFF,
+            kind,
         }
+    }
+
+    /// Create a key stream for `kind` from a 64-bit key (deriving `(start, mult, inc)`).
+    pub fn new(kind: EncryptionType, key: u64) -> Self {
+        let lo = (key as u32) ^ ((key >> 32) as u32);
+        // Odd multiplier (mod 4 == 1) and odd increment ensure full 15-bit period.
+        let (start, mult, inc) = match kind {
+            EncryptionType::Type8 => (
+                ((lo as u16) ^ 0x4567) & 0x7FFF,
+                ((((lo >> 16) as u16) | 1) & 0x7FFD) | 1,
+                (((lo >> 8) as u16) | 1) & 0x7FFF,
+            ),
+            EncryptionType::Type9 => (
+                ((lo as u16) ^ 0x1357) & 0x7FFF,
+                (((((lo >> 16) as u16) ^ 0x0D19) & 0x7FFC) | 1),
+                ((((lo >> 8) as u16) ^ 0x043B) | 1) & 0x7FFF,
+            ),
+            EncryptionType::None => (0, 1, 0),
+        };
+        Self::from_params(kind, start, mult, inc)
     }
 
     /// Reset to the initial state.
@@ -433,37 +456,32 @@ impl LcgKeyStream {
         self.state = self.initial;
     }
 
-    /// Next key byte.
-    pub fn next_byte(&mut self) -> u8 {
-        self.state = match self.kind {
-            EncryptionType::Type8 => self
-                .state
-                .wrapping_mul(0x0003_43FD)
-                .wrapping_add(0x0026_9EC3),
-            EncryptionType::Type9 => self
-                .state
-                .wrapping_mul(0x0019_660D)
-                .wrapping_add(0x3C6E_F35F),
-            EncryptionType::None => self.state,
-        };
-        (self.state >> 16) as u8
+    /// Return the current 13-bit scale XOR mask and advance the 15-bit LCG by one frame.
+    pub fn next_scale_mask(&mut self) -> u16 {
+        if self.kind == EncryptionType::None {
+            return 0;
+        }
+        let mask = self.state & 0x1FFF;
+        self.state = ((self.state as u32)
+            .wrapping_mul(self.mult as u32)
+            .wrapping_add(self.inc as u32)
+            & 0x7FFF) as u16;
+        mask
     }
 
-    /// XOR `data` (frame payload bytes) with the advancing key stream.
-    pub fn apply(&mut self, data: &mut [u8]) {
-        if self.kind == EncryptionType::None {
-            return;
-        }
-        for b in data.iter_mut() {
-            *b ^= self.next_byte();
-        }
+    /// Return the low 8 bits of the next 15-bit LCG step (compatibility helper).
+    pub fn next_byte(&mut self) -> u8 {
+        self.next_scale_mask() as u8
     }
 }
 
-/// XOR one frame's payload bytes (bytes `2..18`, scale preserved in clear).
+/// XOR one ADX channel frame's 13-bit scale field (bytes `0..2`) with the LCG key stream.
 pub fn xor_frame(frame: &mut [u8], stream: &mut LcgKeyStream) {
-    if frame.len() > 2 {
-        stream.apply(&mut frame[2..]);
+    if frame.len() >= 2 && stream.kind != EncryptionType::None {
+        let raw = u16::from_be_bytes([frame[0], frame[1]]);
+        let mask = stream.next_scale_mask();
+        let xored = (raw & 0xE000) | ((raw ^ mask) & 0x1FFF);
+        frame[0..2].copy_from_slice(&xored.to_be_bytes());
     }
 }
 
@@ -495,7 +513,8 @@ pub fn decode_frame(
     if header.encoding == AdxEncoding::Ahx {
         return Err(Error::Unsupported("AHX decoding"));
     }
-    let scale_raw = u16::from_be_bytes([frame[0], frame[1]]) as i32;
+    let scale_raw = (u16::from_be_bytes([frame[0], frame[1]]) & 0x1FFF) as i32;
+    let scale = scale_raw + 1;
     for i in 0..SAMPLES_PER_FRAME {
         let byte = frame[2 + i / 2];
         let nib = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
@@ -504,7 +523,7 @@ pub fn decode_frame(
                 let exp = (scale_raw & 0x0F).min(15);
                 signed_nibble(nib) * (1i32 << exp)
             }
-            _ => signed_nibble(nib) * scale_raw,
+            _ => signed_nibble(nib) * scale,
         };
         let pred = (header.coeff1 * hist.0 + header.coeff2 * hist.1) >> 12;
         let sample = clamp16(residual + pred);
@@ -523,6 +542,7 @@ pub struct AdxDecoder<'a> {
     group: usize,
     key_stream: Option<LcgKeyStream>,
     key: u64,
+    key_params: Option<(u16, u16, u16)>,
     looping: bool,
     pending: [i16; SAMPLES_PER_FRAME * MAX_CHANNELS],
     pending_frames: usize,
@@ -539,6 +559,7 @@ impl<'a> AdxDecoder<'a> {
             group: 0,
             key_stream: None,
             key: 0,
+            key_params: None,
             looping: view.header.loop_points.is_some(),
             pending: [0; SAMPLES_PER_FRAME * MAX_CHANNELS],
             pending_frames: 0,
@@ -573,6 +594,13 @@ impl<'a> AdxDecoder<'a> {
     /// Supply the decryption key for type 8 / 9 streams and reset.
     pub fn set_key(&mut self, key: u64) -> Result<()> {
         self.key = key;
+        self.key_params = None;
+        self.reset()
+    }
+
+    /// Supply explicit CRI type 8 / 9 LCG parameters `(start, mult, inc)` and reset.
+    pub fn set_key_params(&mut self, start: u16, mult: u16, inc: u16) -> Result<()> {
+        self.key_params = Some((start, mult, inc));
         self.reset()
     }
 
@@ -588,7 +616,10 @@ impl<'a> AdxDecoder<'a> {
         self.finished = false;
         self.key_stream = match self.view.header.encryption {
             EncryptionType::None => None,
-            kind => Some(LcgKeyStream::new(kind, self.key)),
+            kind => Some(match self.key_params {
+                Some((start, mult, inc)) => LcgKeyStream::from_params(kind, start, mult, inc),
+                None => LcgKeyStream::new(kind, self.key),
+            }),
         };
         Ok(())
     }
@@ -600,12 +631,12 @@ impl<'a> AdxDecoder<'a> {
             if self.looping {
                 if let Some(lp) = self.view.header.loop_points {
                     self.group = (lp.start_sample as usize) / SAMPLES_PER_FRAME;
-                    // Reposition key stream to the loop-start group.
-                    let skip = self.group * self.channels() * (FRAME_SIZE - 2);
+                    // Reposition key stream to the loop-start group (1 step per channel frame).
+                    let skip = self.group * self.channels();
                     if let Some(ks) = &mut self.key_stream {
                         ks.reset();
                         for _ in 0..skip {
-                            ks.next_byte();
+                            ks.next_scale_mask();
                         }
                     }
                 } else {
@@ -848,8 +879,12 @@ fn encode_channel_frame(
             (e as u16, 1 << e)
         }
         _ => {
-            let s = if max_abs == 0 { 0 } else { (max_abs + 6) / 7 };
-            (s as u16, s.max(1))
+            let s = if max_abs == 0 {
+                1
+            } else {
+                ((max_abs + 6) / 7).clamp(1, 0x2000)
+            };
+            ((s - 1) as u16, s)
         }
     };
     frame[0..2].copy_from_slice(&scale_field.to_be_bytes());
@@ -890,7 +925,7 @@ pub fn build_header(
     loop_points: Option<AdxLoop>,
 ) -> Result<alloc::vec::Vec<u8>> {
     let history_count = (channels as usize).max(2);
-    let ext_len = if loop_points.is_some() { 28 } else { 2 };
+    let ext_len = if loop_points.is_some() { 26 } else { 2 };
     let header_size = 0x18 + history_count * 4 + ext_len + 6;
     let mut h = alloc::vec![0u8; header_size];
     h[0..2].copy_from_slice(&ADX_MAGIC.to_be_bytes());
@@ -914,6 +949,7 @@ pub fn build_header(
     }
     let at = 0x18 + history_count * 4;
     if let Some(lp) = loop_points {
+        h[at + 2..at + 4].copy_from_slice(&1u16.to_be_bytes());
         h[at + 4..at + 8].copy_from_slice(&1u32.to_be_bytes());
         h[at + 8..at + 12].copy_from_slice(&lp.start_sample.to_be_bytes());
         h[at + 12..at + 16].copy_from_slice(&lp.start_byte.to_be_bytes());

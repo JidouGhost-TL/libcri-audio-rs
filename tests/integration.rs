@@ -299,12 +299,12 @@ fn adx_rejects_bad_inputs() {
 
 fn make_hca(cipher_type: u16, key: u64, frames: u32) -> (Vec<u8>, HcaCipher) {
     let comp = HcaComp {
-        min_resolution: 0,
+        min_resolution: 1,
         max_resolution: 15,
         track_count: 1,
         channel_config: 0,
-        total_bands: 8,
-        base_bands: 8,
+        total_bands: 16,
+        base_bands: 16,
         stereo_bands: 0,
         bands_per_hfr_group: 0,
     };
@@ -315,7 +315,7 @@ fn make_hca(cipher_type: u16, key: u64, frames: u32) -> (Vec<u8>, HcaCipher) {
         frames,
         512,
         comp,
-        Some(1),
+        Some(0),
         Some(HcaLoop {
             start_frame: 0,
             end_frame: frames,
@@ -331,10 +331,10 @@ fn make_hca(cipher_type: u16, key: u64, frames: u32) -> (Vec<u8>, HcaCipher) {
         56 => HcaCipher::type56(key),
         _ => HcaCipher::none(),
     };
-    let enc = HcaEncoder::new(2, 8, 0, 512, cipher.clone()).unwrap();
+    let enc = HcaEncoder::new(2, 16, 0, 512, cipher.clone()).unwrap();
     let mut spectrum = [0.0f32; 128];
-    for (i, v) in spectrum.iter_mut().enumerate() {
-        *v = ((i * 37 % 13) as f32 - 6.0) * 20.0;
+    for (i, v) in spectrum.iter_mut().enumerate().take(16) {
+        *v = ((i * 37 % 13) as f32 - 6.0) * 0.5;
     }
     let silence = [0.0f32; 128];
     let mut bytes = header;
@@ -403,15 +403,25 @@ fn hca_versions_parse() {
 fn hca_decode_silence_and_signal_and_f32() {
     let (bytes, _) = make_hca(0, 0, 4);
     let mut dec = HcaDecoder::new(&bytes).unwrap();
-    let mut buf = [0i16; 128 * 2];
+    assert_eq!(dec.header().total_samples(), 4 * 1024);
+    // Inspect frame 0 and frame 1 headers (0xFFFF sync + 6-bit scalefactors).
+    let fh0 = dec.inspect_frame_header(0).unwrap();
+    assert_eq!(fh0.sync, hca::FRAME_SYNC);
+    let fh1 = dec.inspect_frame_header(1).unwrap();
+    assert_eq!(fh1.sync, hca::FRAME_SYNC);
+    assert!(fh1.scale_factors[0][..16].iter().any(|&s| s > 0));
+
+    // Frame 0 is 1024 silent sample-frames.
+    let mut buf = [0i16; 1024 * 2];
     let n1 = dec.decode_i16(&mut buf).unwrap();
-    assert_eq!(n1, 128);
+    assert_eq!(n1, 1024);
     assert!(
         buf.iter().all(|&v| v == 0),
         "first (silent-spectrum) frame must be silent"
     );
+    // Frame 1 is 1024 non-silent sample-frames.
     let n2 = dec.decode_i16(&mut buf).unwrap();
-    assert_eq!(n2, 128);
+    assert_eq!(n2, 1024);
     assert!(
         buf.iter().any(|&v| v != 0),
         "signal frame must be non-silent"
@@ -419,14 +429,17 @@ fn hca_decode_silence_and_signal_and_f32() {
     // f32 planar agrees in sign/magnitude scale with i16 path on a fresh decoder.
     let mut dec2 = HcaDecoder::new(&bytes).unwrap();
     let (mut l, mut r) = ([0f32; 128], [0f32; 128]);
-    dec2.decode_f32_planar(&mut [&mut l, &mut r]).unwrap();
+    // Skip the 8 silent subframes (1024 samples) of frame 0.
+    for _ in 0..8 {
+        assert_eq!(dec2.decode_f32_planar(&mut [&mut l, &mut r]).unwrap(), 128);
+    }
     let m = dec2.decode_f32_planar(&mut [&mut l, &mut r]).unwrap();
     assert_eq!(m, 128);
     assert!(l.iter().any(|&v| v != 0.0));
     // reset determinism
     dec.reset();
-    let mut again = [0i16; 128 * 2];
-    assert_eq!(dec.decode_i16(&mut again).unwrap(), 128);
+    let mut again = [0i16; 1024 * 2];
+    assert_eq!(dec.decode_i16(&mut again).unwrap(), 1024);
     assert!(again.iter().all(|&v| v == 0));
 }
 
@@ -435,18 +448,103 @@ fn hca_cipher_type56_keyed_decode() {
     let key = 0x0123_4567_89AB_CDEFu64;
     let (bytes, _) = make_hca(56, key, 3);
     let mut dec = HcaDecoder::with_key(&bytes, key).unwrap();
-    let mut buf = [0i16; 128 * 2];
+    let mut buf = [0i16; 1024 * 2];
     dec.decode_i16(&mut buf).unwrap();
     dec.decode_i16(&mut buf).unwrap();
     assert!(buf.iter().any(|&v| v != 0));
     // Wrong key: frame CRC after decipher fails.
     let mut wrong = HcaDecoder::with_key(&bytes, key ^ 1).unwrap();
-    let mut b2 = [0i16; 128 * 2];
+    let mut b2 = [0i16; 1024 * 2];
     assert!(wrong.decode_i16(&mut b2).is_err());
     // Type 1 keyless also decodes.
     let (bytes1, _) = make_hca(1, 0, 2);
     let mut d1 = HcaDecoder::new(&bytes1).unwrap();
-    assert_eq!(d1.decode_i16(&mut buf).unwrap(), 128);
+    assert_eq!(d1.decode_i16(&mut buf).unwrap(), 1024);
+}
+
+#[test]
+fn hca_cipher_type56_awb_subkey_and_ath_table() {
+    let key = 0x0012_3456_789A_BCDEu64;
+    let subkey = 0x2F41u16;
+    let c0 = HcaCipher::type56_with_awb_subkey(key, 0);
+    let c1 = HcaCipher::type56_with_awb_subkey(key, subkey);
+    assert_ne!(c0, c1);
+    assert_eq!(hca::derive_type56_subkey(key, 0), key);
+    assert_ne!(hca::derive_type56_subkey(key, subkey), key);
+
+    let ath0 = hca::build_ath_table(0, 48000);
+    assert!(ath0.iter().all(|&v| v == 0));
+    let ath1 = hca::build_ath_table(1, 48000);
+    assert!(ath1[0] > ath1[20], "sub-bass ATH higher than mid-band");
+    assert!(ath1[127] > ath1[20], "ultrasonic ATH higher than mid-band");
+}
+
+#[test]
+fn real_cri_samples_env_gated() {
+    let Ok(dir) = std::env::var("LIBCRI_SAMPLE_DIR") else {
+        return;
+    };
+    let root = std::path::Path::new(&dir);
+    let mut hca_checked = 0usize;
+    let mut adx_checked = 0usize;
+
+    fn visit(p: &std::path::Path, hca_checked: &mut usize, adx_checked: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, hca_checked, adx_checked);
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            if ext == "adx" {
+                let hdr = adx::AdxHeader::parse(&data).unwrap();
+                assert!(hdr.sample_rate > 0 && hdr.channels > 0);
+                *adx_checked += 1;
+            } else if ext == "hca" {
+                let mut dec = HcaDecoder::new(&data).unwrap();
+                let frames = dec.header().frame_count as usize;
+                // Verify CRC-16, 0xFFFF sync, a/b, and delta-coded scalefactors on every frame.
+                for fi in 0..frames {
+                    let fh = dec.inspect_frame_header(fi).unwrap();
+                    assert_eq!(fh.sync, hca::FRAME_SYNC);
+                }
+                // Decode up to 16 frames to verify finite, bounded PCM output.
+                let ch = dec.channels();
+                let mut pcm = vec![0.0f32; 1024 * ch];
+                let mut decoded_frames = 0usize;
+                for _ in 0..frames.min(16) {
+                    let n = dec.decode_f32(&mut pcm).unwrap();
+                    assert!(n > 0);
+                    assert!(pcm[..n * ch]
+                        .iter()
+                        .all(|v| v.is_finite() && v.abs() <= 1.0001));
+                    decoded_frames += 1;
+                }
+                assert!(decoded_frames > 0);
+                *hca_checked += 1;
+            }
+        }
+    }
+
+    visit(root, &mut hca_checked, &mut adx_checked);
+    assert!(
+        hca_checked > 0,
+        "expected at least one .hca in LIBCRI_SAMPLE_DIR"
+    );
+    assert!(
+        adx_checked > 0,
+        "expected at least one .adx in LIBCRI_SAMPLE_DIR"
+    );
 }
 
 #[test]

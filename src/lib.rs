@@ -123,7 +123,10 @@ impl std::error::Error for Error {}
 
 pub use adx::{AdxDecoder, AdxEncoder, AdxEncoding, AdxHeader, AdxLoop, AdxView, EncryptionType};
 pub use crc::crc16;
-pub use hca::{HcaCipher, HcaComp, HcaDecoder, HcaEncoder, HcaHeader, HcaLoop, HcaView};
+pub use hca::{
+    HcaChannelType, HcaCipher, HcaComp, HcaDecoder, HcaEncoder, HcaFrameHeader, HcaHeader, HcaLoop,
+    HcaView, ImdctTables,
+};
 
 #[cfg(test)]
 mod tests {
